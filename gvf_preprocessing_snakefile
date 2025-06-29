@@ -1,0 +1,197 @@
+########################################
+# Snakefile (With Batch Timing in Minutes, No Python imports)
+########################################
+
+REF_GZ = "ref_files/schistosoma_mansoni.PRJEA36577.WBPS19.genomic.fa.gz"
+REF = REF_GZ[:-3]
+WINDOW_SIZE = 10000
+CONTAINERS = "../containers"
+SAMPLES = "samples.txt"
+THREADS = 16
+
+with open(SAMPLES) as f:
+    all_samples = [s.strip() for s in f if s.strip()]
+
+gvcfs = expand("gvcf/{sample}.g.vcf", sample=all_samples)
+
+rule all:
+    input:
+        "cohort.fullmatrix.vcf.gz"
+
+rule start_batch_timer:
+    output: touch("batch_start.txt")
+    shell:
+        "date +%s > {output}"
+
+rule decompress_reference:
+    input: REF_GZ
+    output: REF
+    shell:
+        """
+        start=$(date +%s)
+        if [ ! -s {output} ]; then
+            gunzip -c {input} > {output}
+        fi
+        end=$(date +%s)
+        echo "[Time] decompress_reference: $(((end - start)/60)) minutes"
+        """
+
+rule index_reference:
+    input: REF
+    output:
+        fai=REF + ".fai",
+        amb=REF + ".amb",
+        ann=REF + ".ann",
+        bwt=REF + ".bwt",
+        pac=REF + ".pac",
+        sa=REF + ".sa",
+        dict=REF.replace(".fa", ".dict")
+    shell:
+        """
+        start=$(date +%s)
+        apptainer exec {CONTAINERS}/samtools_1.9.simg samtools faidx {input}
+        apptainer exec {CONTAINERS}/bwa.0.7.17.simg bwa index {input}
+        apptainer exec {CONTAINERS}/samtools_1.9.simg samtools dict {input} -o {output.dict}
+        end=$(date +%s)
+        echo "[Time] index_reference: $(((end - start)/60)) minutes"
+        """
+
+rule make_windows:
+    input: REF + ".fai"
+    output: "windows/{}bp_windows.bed".format(WINDOW_SIZE)
+    shell:
+        """
+        start=$(date +%s)
+        apptainer exec {CONTAINERS}/bedtools.2.31.simg \
+        bedtools makewindows -g {input} -w {WINDOW_SIZE} > {output}
+        end=$(date +%s)
+        echo "[Time] make_windows: $(((end - start)/60)) minutes"
+        """
+
+rule download_reads:
+    output:
+        R1=temp("reads/{sample}_1.fastq.gz"),
+        R2=temp("reads/{sample}_2.fastq.gz")
+    params:
+        sample=lambda wc: wc.sample
+    shell:
+        r"""
+        set -euo pipefail
+        start=$(date +%s)
+
+        urls=$(curl -fsSL "https://www.ebi.ac.uk/ena/portal/api/filereport?accession={params.sample}&result=read_run&fields=fastq_ftp&format=tsv" \
+               | awk 'NR>1 {{print $NF}}' | tr ';' '\n')
+
+        for URL in $urls; do
+            [ -z "$URL" ] && continue
+            out="reads/$(basename "$URL")"
+
+            # Use FTP directly; retry forever; generous read-timeout
+            wget --continue --tries=0 \
+                 --connect-timeout=60 --read-timeout=600 \
+                 --waitretry=10 --retry-connrefused \
+                 -O "$out" "$URL"
+
+            # basic integrity check
+            if [ ! -s "$out" ]; then
+                echo "ERROR: $out is empty, retrying…" >&2
+                rm -f "$out"
+                exit 1
+            fi
+        done
+
+        end=$(date +%s)
+        echo "[Time] download_reads {params.sample}: $(((end - start)/60)) minutes"
+        """
+
+rule per_sample:
+    input:
+        R1="reads/{sample}_1.fastq.gz",
+        R2="reads/{sample}_2.fastq.gz",
+        ref=REF,
+        win_bed="windows/{}bp_windows.bed".format(WINDOW_SIZE)
+    output:
+        bam="bam/{sample}.bam",
+        bai="bam/{sample}.bam.bai",
+        gvcf="gvcf/{sample}.g.vcf",
+        flagstat="stats/{sample}.flagstat",
+        idxstats="stats/{sample}.idxstats",
+        depth="depth/{sample}.depth",
+        win_cov="window_cov/{sample}.window.cov",
+        metrics="work/{sample}.markdup.metrics.txt"
+    threads: THREADS
+    shell:
+        """
+        start=$(date +%s)
+        apptainer exec {CONTAINERS}/bwa.0.7.17.simg \
+            bwa mem -t {threads} {input.ref} {input.R1} {input.R2} \
+          | apptainer exec {CONTAINERS}/samtools_1.9.simg \
+            samtools sort -@ {threads} -o work/{wildcards.sample}.sorted.bam -
+
+        apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg gatk MarkDuplicates \
+            --INPUT work/{wildcards.sample}.sorted.bam \
+            --OUTPUT work/{wildcards.sample}.dedup.bam \
+            --METRICS_FILE {output.metrics}
+
+        apptainer exec {CONTAINERS}/picard_2.27.5.simg \
+          java -jar /usr/picard/picard.jar AddOrReplaceReadGroups \
+          I=work/{wildcards.sample}.dedup.bam O={output.bam} \
+          RGID={wildcards.sample} RGLB=l1 RGPL=ILLUMINA RGPU=unit1 RGSM={wildcards.sample}
+
+        apptainer exec {CONTAINERS}/samtools_1.9.simg samtools index {output.bam}
+
+        apptainer exec {CONTAINERS}/samtools_1.9.simg samtools flagstat {output.bam} > {output.flagstat}
+        apptainer exec {CONTAINERS}/samtools_1.9.simg samtools idxstats {output.bam} > {output.idxstats}
+
+        apptainer exec {CONTAINERS}/samtools_1.9.simg \
+            samtools depth -aa {output.bam} > {output.depth}
+
+        apptainer exec {CONTAINERS}/bedtools.2.31.simg \
+            bedtools coverage -sorted -a {input.win_bed} -b {output.bam} > {output.win_cov}
+
+        apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg gatk HaplotypeCaller \
+            --native-pair-hmm-threads {threads} \
+            --emit-ref-confidence GVCF \
+            --output-mode EMIT_ALL_SITES \
+            -I {output.bam} \
+            -R {input.ref} \
+            -O {output.gvcf}
+
+        rm -f {input.R1} {input.R2} work/{wildcards.sample}.sorted.bam work/{wildcards.sample}.dedup.bam
+        end=$(date +%s)
+        echo "[Time] per_sample {wildcards.sample}: $(((end - start)/60)) minutes"
+        """
+
+rule merge_gvcfs:
+    input: gvcfs
+    output: combined="combined.g.vcf.gz"
+    shell:
+        """
+        start=$(date +%s)
+        apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg gatk CombineGVCFs \
+            -R {REF} \
+            $(for g in {input}; do echo --variant $g; done) \
+            -O {output.combined}
+        end=$(date +%s)
+        echo "[Time] merge_gvcfs: $(((end - start)/60)) minutes"
+        """
+
+rule genotype_gvcfs:
+    input:
+        gvcfs,
+        combined="combined.g.vcf.gz",
+        start_time="batch_start.txt"
+    output: vcf="cohort.fullmatrix.vcf.gz"
+    shell:
+        """
+        start=$(cat {input.start_time})
+        apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg \
+            gatk --java-options "-Xmx60G" GenotypeGVCFs \
+            -R {REF} \
+            -V {input.combined} \
+            --include-non-variant-sites \
+            -O {output.vcf}
+        end=$(date +%s)
+        echo "[Time] genotype_gvcfs: $(((end - start)/60)) minutes"
+        echo "[Batch Runtime] Total: $(((end - start)/60)) minutes"
+        """
