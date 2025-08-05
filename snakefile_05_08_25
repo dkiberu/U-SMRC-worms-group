@@ -1,0 +1,243 @@
+########################################
+# Snakefile – Robust Cohort GVCF Pipeline
+########################################
+
+import os, csv, collections, uuid
+
+###############################################################################
+# CONSTANTS
+###############################################################################
+REF_GZ      = "ref_files/schistosoma_mansoni.PRJEA36577.WBPS19.genomic.fa.gz"
+REF         = REF_GZ[:-3]
+WINDOW_SIZE = 10_000
+WINDOW_BED  = f"windows/{WINDOW_SIZE}bp_windows.bed"
+CONTAINERS  = "../containers"
+THREADS     = 16
+
+###############################################################################
+# SAMPLE ↔ RUN MAPPING
+###############################################################################
+RUNS_BY_SAMPLE = collections.defaultdict(list)
+with open("resolved_accessions.tsv") as fh:
+    for sample, run in csv.reader(fh, delimiter="\t"):
+        RUNS_BY_SAMPLE[sample].append(run)
+
+SAMPLES        = sorted(RUNS_BY_SAMPLE)
+ALL_RUNS       = sorted(r for runs in RUNS_BY_SAMPLE.values() for r in runs)
+
+# ── NEW: constant-time reverse map ────────────────────────────────────────────
+SAMPLE_BY_RUN = {
+    run: sample
+    for sample, runs in RUNS_BY_SAMPLE.items()
+    for run in runs
+}
+
+###############################################################################
+# FINAL TARGET
+###############################################################################
+rule all:
+    input: "cohort.fullmatrix.vcf.gz"
+
+###############################################################################
+# BATCH TIMER
+###############################################################################
+rule start_batch_timer:
+    output: touch("batch_start.txt")
+    shell:  "date +%s > {output}"
+
+###############################################################################
+# REFERENCE PREPARATION
+###############################################################################
+rule decompress_reference:
+    input:  REF_GZ
+    output: REF
+    shell:  "gunzip -c {input} > {output}"
+
+rule index_reference:
+    input:  ref = REF
+    output:
+        fai  = REF + ".fai",
+        amb  = REF + ".amb",
+        ann  = REF + ".ann",
+        bwt  = REF + ".bwt",
+        pac  = REF + ".pac",
+        sa   = REF + ".sa",
+        dict = REF.replace(".fa", ".dict")
+    shell:  """
+        apptainer exec {CONTAINERS}/samtools_1.9.simg samtools faidx {input.ref}
+        apptainer exec {CONTAINERS}/bwa.0.7.17.simg       bwa index   {input.ref}
+        apptainer exec {CONTAINERS}/samtools_1.9.simg samtools dict  {input.ref} -o {output.dict}
+    """
+
+rule make_windows:
+    input:  REF + ".fai"
+    output: WINDOW_BED
+    shell:  """
+        apptainer exec {CONTAINERS}/bedtools.2.31.simg \
+            bedtools makewindows -g {input} -w {WINDOW_SIZE} > {output}
+    """
+
+###############################################################################
+# DOWNLOAD READS
+###############################################################################
+rule download_reads:
+    output:
+        R1 = "reads/{run}_1.fastq.gz",
+        R2 = "reads/{run}_2.fastq.gz"
+    params:
+        run     = "{run}",
+        workdir = lambda wc: f"reads/.partial/{wc.run}"
+    threads: 2
+    shell:  r"""
+        set -euo pipefail
+        mkdir -p "{params.workdir}"
+        urls=$(curl -fsSL \
+          "https://www.ebi.ac.uk/ena/portal/api/filereport?accession={params.run}&result=read_run&fields=fastq_ftp&format=tsv&download=1" |
+          awk 'NR>1{{print $NF}}' | tr ';' '\n' | sed 's@^ftp://@https://@')
+        for url in $urls; do
+            fname="{params.workdir}/$(basename "$url")"
+            wget -c -O "$fname" "$url"
+        done
+        cat "{params.workdir}"/*_1.fastq.gz > {output.R1}
+        if ls "{params.workdir}"/*_2.fastq.gz 1>/dev/null 2>&1; then
+            cat "{params.workdir}"/*_2.fastq.gz > {output.R2}
+        else
+            touch {output.R2}
+        fi
+    """
+
+###############################################################################
+# ALIGN & QC PER-RUN  (sample-aware RG tags)
+###############################################################################
+rule per_run:
+    input:
+        R1      = "reads/{run}_1.fastq.gz",
+        R2      = "reads/{run}_2.fastq.gz",
+        ref     = REF,
+        win_bed = WINDOW_BED
+    output:
+        bam      = "run_bam/{run}.bam",
+        bai      = "run_bam/{run}.bam.bai",
+        flagstat = "run_stats/{run}.flagstat",
+        idxstats = "run_stats/{run}.idxstats",
+        depth    = "run_depth/{run}.depth",
+        win_cov  = "run_window_cov/{run}.window.cov",
+        metrics  = "work/{run}.markdup.metrics.txt"
+    threads: THREADS
+    resources:
+        mem_mb = 80000
+    params:
+        tmp_prefix = lambda wc: os.path.join(
+            os.getenv("TMPDIR", "work"),
+            f"{wc.run}.sorttmp.{uuid.uuid4().hex}"
+        ),
+        sort_mem  = "2G",
+        sample_id = lambda wc: SAMPLE_BY_RUN[wc.run]          # ← NEW
+    shell:  r"""
+        set -euo pipefail
+        apptainer exec {CONTAINERS}/bwa.0.7.17.simg \
+            bwa mem -t {threads} {input.ref} {input.R1} {input.R2} |
+        apptainer exec {CONTAINERS}/samtools_1.9.simg \
+            samtools sort -@ {threads} -m {params.sort_mem} \
+            -T {params.tmp_prefix} -o work/{wildcards.run}.sorted.bam -
+        rm -f {params.tmp_prefix}.*.bam || true
+
+        apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg \
+            gatk --java-options "-Xmx20G" MarkDuplicates \
+                 --INPUT  work/{wildcards.run}.sorted.bam \
+                 --OUTPUT work/{wildcards.run}.dedup.bam \
+                 --METRICS_FILE {output.metrics}
+
+        apptainer exec {CONTAINERS}/picard_2.27.5.simg \
+            java -jar /usr/picard/picard.jar AddOrReplaceReadGroups \
+            I=work/{wildcards.run}.dedup.bam O={output.bam} \
+            RGID={wildcards.run} RGLB=l1 RGPL=ILLUMINA RGPU=unit1 RGSM={params.sample_id}
+
+        apptainer exec {CONTAINERS}/samtools_1.9.simg samtools index    {output.bam}
+        apptainer exec {CONTAINERS}/samtools_1.9.simg samtools flagstat {output.bam} > {output.flagstat}
+        apptainer exec {CONTAINERS}/samtools_1.9.simg samtools idxstats {output.bam} > {output.idxstats}
+        apptainer exec {CONTAINERS}/samtools_1.9.simg samtools depth -aa {output.bam} > {output.depth}
+        apptainer exec {CONTAINERS}/bedtools.2.31.simg \
+            bedtools coverage -sorted -a {input.win_bed} -b {output.bam} > {output.win_cov}
+
+        rm -f work/{wildcards.run}.sorted.bam work/{wildcards.run}.dedup.bam || true
+    """
+
+###############################################################################
+# HaplotypeCaller – auto-balance heap vs threads
+###############################################################################
+def _bam_list(sample):
+    return [f"run_bam/{r}.bam" for r in RUNS_BY_SAMPLE[sample]]
+
+def _native_threads(sample):
+    n = len(RUNS_BY_SAMPLE[sample])
+    if   n <=  4: return 16
+    elif n <=  8: return 12
+    elif n <= 12: return 8
+    else:         return 4
+
+def _mem_mb(sample):
+    gb = 1.3 * (5 + 3*len(RUNS_BY_SAMPLE[sample]))   # 5 GB base + 3 GB / BAM × 1.3 pad
+    return int(gb * 1024)
+
+rule haplotypecaller_sample:
+    input:
+        bams = lambda wc: _bam_list(wc.sample),
+        ref  = REF
+    output:
+        gvcf     = "gvcf/{sample}.g.vcf.gz",
+        gvcf_tbi = "gvcf/{sample}.g.vcf.gz.tbi"
+    threads:  lambda wc: _native_threads(wc.sample)
+    resources:
+        mem_mb = lambda wc: _mem_mb(wc.sample)
+    params:
+        bam_flags = lambda wc: " ".join(f"-I {p}" for p in _bam_list(wc.sample)),
+        heap_opts = lambda wc, resources: f"-Xmx{resources.mem_mb - 1024}M"
+    shell: r"""
+        set -euo pipefail
+        apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg \
+            gatk --java-options "{params.heap_opts}" HaplotypeCaller \
+                 {params.bam_flags} \
+                 --reference {input.ref} \
+                 --output    {output.gvcf} \
+                 --emit-ref-confidence GVCF \
+                 --output-mode EMIT_ALL_SITES \
+                 --native-pair-hmm-threads {threads}
+    """
+
+###############################################################################
+# GenotypeGVCFs – cohort genotyping
+###############################################################################
+rule genotype_gvcfs:
+    input:
+        gvcfs    = expand("gvcf/{sample}.g.vcf.gz", sample=SAMPLES)
+    output:
+        combined = temp("combined.g.vcf.gz")
+    resources:
+        mem_mb = 80000
+    shell: r"""
+        apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg \
+            gatk --java-options "-Xmx60G" \
+                 CombineGVCFs -R {REF} \
+                 $(printf -- '--variant %s ' {input.gvcfs}) \
+                 -O {output.combined}
+    """
+
+rule genotype_gvcfs_finalize:
+    input:
+        combined   = "combined.g.vcf.gz",
+        start_time = "batch_start.txt"
+    output:
+        vcf = "cohort.fullmatrix.vcf.gz"
+    resources:
+        mem_mb = 80000
+    shell: r"""
+        start=$(cat {input.start_time})
+        apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg \
+            gatk --java-options "-Xmx60G" GenotypeGVCFs \
+                 -R {REF} -V {input.combined} \
+                 --include-non-variant-sites \
+                 -O {output.vcf}
+        end=$(date +%s)
+        echo "[Batch Runtime] Total: $(((end-start)/60)) min"
+    """
