@@ -1,0 +1,159 @@
+########################################
+# Auto-level CombineGVCFs hierarchy (minimal)
+# - Reference: ref_files/schistosoma_mansoni.PRJEA36577.WBPS19.genomic.fa
+# - Inputs: test_gvcfs_list (one path per line)
+# - Builds as many levels as needed until one output remains
+# - Ensures REF .fai/.dict and input .tbi exist
+########################################
+import os, sys, re
+
+REF         = "ref_files/schistosoma_mansoni.PRJEA36577.WBPS19.genomic.fa"
+CONTAINERS  = "../containers"
+LIST_FILE   = "test_gvcfs_list"
+
+# Upper bound of inputs per CombineGVCFs call (same for all levels)
+MAX_COMBINED_SIZE = 40   # change if needed; depth auto-calculated
+
+# ---------- load inputs ----------
+if not os.path.exists(LIST_FILE):
+    sys.stderr.write(f"Missing list file: {LIST_FILE}\n"); sys.exit(1)
+with open(LIST_FILE) as fh:
+    GVCFS = [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
+if not GVCFS:
+    sys.stderr.write("No gVCFs found in list file.\n"); sys.exit(1)
+
+# ---------- helpers ----------
+def chunks(xs, n):
+    n = max(1, n)
+    return [xs[i:i+n] for i in range(0, len(xs), n)]
+
+def ref_dict_path(ref):
+    if ref.endswith(".fa"):     return ref[:-3] + ".dict"
+    if ref.endswith(".fasta"):  return ref[:-6] + ".dict"
+    return ref + ".dict"
+
+REF_FAI  = REF + ".fai"
+REF_DICT = ref_dict_path(REF)
+
+# ---------- build auto levels ----------
+MERGE_MAP  = {}
+LEVEL_IDS  = {}
+ALL_IDS    = []
+idx        = 0
+level      = 1
+current    = GVCFS[:]  # start from raw inputs
+
+while len(current) > 1:
+    group_ids = []
+    for group in chunks(current, MAX_COMBINED_SIZE):
+        gid = f"g{idx:04d}"
+        MERGE_MAP[(level, gid)] = group
+        group_ids.append(gid)
+        ALL_IDS.append(gid)
+        idx += 1
+    LEVEL_IDS[level] = group_ids
+    # next level takes outputs from this level
+    current = [f"level{level}/{gid}.g.vcf.gz" for gid in group_ids]
+    level += 1
+
+N_LEVELS = level - 1
+if N_LEVELS == 0:
+    sys.stderr.write("Only one gVCF provided; nothing to combine.\n"); sys.exit(1)
+
+FINAL_PATH = current[0]  # "level{N_LEVELS}/gXXXX.g.vcf.gz"
+
+# ---------- constraints ----------
+wildcard_constraints:
+    level="|".join(str(i) for i in range(1, N_LEVELS+1)),
+    id="|".join(re.escape(i) for i in ALL_IDS),
+
+# ---------- targets ----------
+rule all:
+    input:
+        "combined.g.vcf.gz",
+        "combined.g.vcf.gz.tbi"
+
+# ---------- reference indices ----------
+rule faidx_ref:
+    input: REF
+    output: REF_FAI
+    shell: r"""
+      set -euo pipefail
+      if [ ! -s {output} ]; then
+       apptainer exec {CONTAINERS}/samtools_1.9.simg samtools faidx {input}
+      fi
+    """
+
+rule dict_ref:
+    input: REF
+    output: REF_DICT
+    shell: r"""
+      set -euo pipefail
+      if [ ! -s {output} ]; then
+        apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg \
+          gatk CreateSequenceDictionary -R {input} -O {output}
+      fi
+    """
+
+# ---------- ensure input .tbi ----------
+rule index_input_gvcfs:
+    input: GVCFS
+    output: touch("inputs_indexed.done")
+    params:
+        files=" ".join(GVCFS)
+    shell: r"""
+      set -euo pipefail
+      for p in {params.files}; do
+        if [ ! -s "${{p}}.tbi" ]; then
+          apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg \
+            gatk IndexFeatureFile --feature-file "${{p}}"
+        fi
+      done
+      touch {output}
+    """
+
+# ---------- merge rule (covers all levels) ----------
+merge_cmd = r"""
+set -euo pipefail
+HEAP=$(( {resources.mem_mb} - 2000 ))
+if [ "${{HEAP}}" -lt 3000 ]; then HEAP=3000; fi
+TMP="${{TMPDIR:-/tmp}}"
+export _JAVA_OPTIONS="-Djava.io.tmpdir=${{TMP}}"
+
+apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg \
+  gatk --java-options "-Xmx${{HEAP}}m -XX:+UseG1GC" \
+    CombineGVCFs -R {REF} \
+    $(printf -- '--variant %q ' {input.gvcf}) \
+    -O {output.gvcf}
+
+apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg \
+  gatk IndexFeatureFile --feature-file {output.gvcf}
+"""
+
+rule merge:
+    input:
+        ref=REF, fai=REF_FAI, dict=REF_DICT, idxs="inputs_indexed.done",
+        gvcf=lambda wc: MERGE_MAP[(int(wc.level), wc.id)]
+    output:
+        gvcf=temp("level{level}/{id}.g.vcf.gz")
+    resources:
+        mem_mb=64000
+    shell: merge_cmd
+
+# ---------- finalize ----------
+rule rename_combined:
+    input:
+        gvcf=FINAL_PATH
+    output:
+        gvcf="combined.g.vcf.gz",
+        tbi="combined.g.vcf.gz.tbi"
+    shell: r"""
+      set -euo pipefail
+      mv {input.gvcf} {output.gvcf}
+      if [ -s {input.gvcf}.tbi ]; then
+        mv {input.gvcf}.tbi {output.tbi}
+      else
+        apptainer exec {CONTAINERS}/gatk_4.1.3.0.simg \
+          gatk IndexFeatureFile --feature-file {output.gvcf}
+      fi
+    """
